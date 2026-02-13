@@ -12,188 +12,6 @@ import vllm.envs as envs
 
 logger = init_logger(__name__)
 
-@triton.jit
-def _fp16_mqa_logits_kernel(
-    Q_ptr,              # [seq_len, H, D]
-    KV_ptr,             # [seq_len_kv, D]
-    weights_ptr,        # [seq_len, H]
-    cu_start_ptr,       # [seq_len]
-    cu_end_ptr,         # [seq_len]
-    logits_ptr,         # [seq_len, seq_len_kv]
-    seq_len,
-    seq_len_kv,
-    NUM_HEADS: tl.constexpr,
-    HEAD_SIZE: tl.constexpr,
-    # strides
-    stride_q_s: tl.int64,
-    stride_q_h: tl.constexpr,
-    stride_q_d: tl.constexpr,
-    stride_kv_s: tl.int64,
-    stride_kv_d: tl.constexpr,
-    stride_w_s: tl.int64,
-    stride_w_h: tl.constexpr,
-    stride_logits_s: tl.int64,
-    stride_logits_k: tl.int64,
-    # block sizes
-    BLOCK_Q: tl.constexpr,  # Process multiple queries at once
-    BLOCK_KV: tl.constexpr,
-):
-    # 1. Program ID handles a block of Queries now
-    pid = tl.program_id(0)
-    start_q = pid * BLOCK_Q
-    
-    # 2. Setup Query Offsets [BLOCK_Q]
-    offs_q = start_q + tl.arange(0, BLOCK_Q)
-    mask_q = offs_q < seq_len
-
-    # 3. Load Causal Mask boundaries for this block of Queries
-    # [BLOCK_Q] vector
-    qs_starts = tl.load(cu_start_ptr + offs_q, mask=mask_q, other=0)
-    qs_ends = tl.load(cu_end_ptr + offs_q, mask=mask_q, other=0)
-
-    # Optimization: Skip KV blocks that are completely outside the window for this Q block
-    # (Optional, but helps performance on diagonal)
-    # For simplicity, we process all and mask later, similar to original.
-
-    # 4. Loop over KV Cache in chunks
-    # We iterate 0..seq_len_kv
-    # For each KV chunk, we compute results for ALL heads and ALL queries in this block
-    for kv_start in range(0, seq_len_kv, BLOCK_KV):
-        offs_kv = kv_start + tl.arange(0, BLOCK_KV)
-        
-        # Load KV Transposed: [HEAD_SIZE, BLOCK_KV]
-        # We need (D, B) layout for dot product
-        d_inds = tl.arange(0, HEAD_SIZE)
-        kv_ptrs = (
-            KV_ptr 
-            + (offs_kv[None, :] * stride_kv_s) # col step
-            + (d_inds[:, None] * stride_kv_d)  # row step
-        )
-        # Mask for tail KV blocks
-        mask_kv = offs_kv[None, :] < seq_len_kv
-        kv_block = tl.load(kv_ptrs, mask=mask_kv, other=0.0)
-
-        # Accumulator for Logits: [BLOCK_Q, BLOCK_KV]
-        acc = tl.zeros([BLOCK_Q, BLOCK_KV], dtype=tl.float32)
-
-        # 5. Inner Loop: Iterate over Heads
-        # We process heads sequentially to save memory (Registers/LDS)
-        for h in range(NUM_HEADS):
-            # Load Q Tile for this Head: [BLOCK_Q, HEAD_SIZE]
-            q_ptrs = (
-                Q_ptr 
-                + (offs_q[:, None] * stride_q_s) 
-                + (h * stride_q_h) 
-                + (d_inds[None, :] * stride_q_d)
-            )
-            q_tile = tl.load(q_ptrs, mask=mask_q[:, None], other=0.0)
-
-            # Load Weights for this Head: [BLOCK_Q]
-            w_ptrs = weights_ptr + (offs_q * stride_w_s) + (h * stride_w_h)
-            w_tile = tl.load(w_ptrs, mask=mask_q, other=0.0)
-
-            # Compute Dot: [BLOCK_Q, D] @ [D, BLOCK_KV] -> [BLOCK_Q, BLOCK_KV]
-            score = tl.dot(q_tile.to(tl.float32), kv_block.to(tl.float32))
-            
-            # Apply ReLU and Weight
-            score = tl.maximum(score, 0.0)
-            score = score * w_tile[:, None] # broadcast weight along KV dim
-
-            # Accumulate
-            acc += score
-
-        # 6. Apply Causal Masking
-        # Check if KV indices are within [start, end) for each Q
-        # qs_starts is [BLOCK_Q], offs_kv is [BLOCK_KV]
-        # Broadcast comparisons
-        in_window = (offs_kv[None, :] >= qs_starts[:, None]) & \
-                    (offs_kv[None, :] < qs_ends[:, None])
-        
-        # 7. Store Logits
-        logits_ptrs = (
-            logits_ptr 
-            + (offs_q[:, None] * stride_logits_s) 
-            + (offs_kv[None, :] * stride_logits_k)
-        )
-        
-        # Mask out-of-bounds Q (tail) and out-of-bounds KV (tail) AND causal window
-        final_mask = mask_q[:, None] & mask_kv & in_window
-        tl.store(logits_ptrs, acc, mask=final_mask)
-
-# First implementation attempt, not optimized, currently slower than torch reference
-def fp16_mqa_logits(
-    Q,
-    KV,
-    weights,
-    cu_starts,
-    cu_ends,
-):
-    """
-    This function computes the logits to be used by a topk function for sparse attention.
-
-    Q:           [seq_len, NUM_HEADS, HEAD_SIZE], dtype float16
-    KV:          [seq_len_kv, HEAD_SIZE], dtype float16
-    weights:     [seq_len, NUM_HEADS], dtype float32
-    cu_starts:   [seq_len], dtype int32, start indices
-    cu_ends:     [seq_len], dtype int32, end indices
-
-    Returns:
-    logits:      [seq_len, seq_len_kv], dtype float32 (must be initialized to -inf, because of causal masking)
-    """
-    seq_len, num_heads, head_size = Q.shape
-    seq_len_kv = KV.shape[0]
-    # TODO: Currently assuming num_heads and head_size is power of 2.
-    assert num_heads & (num_heads - 1) == 0, "num q. heads should be power of 2."
-    assert head_size & (head_size - 1) == 0, "head size should be power of 2."
-    # Initialize with -inf because of causal masking
-    logits = torch.full(
-        (seq_len, seq_len_kv),
-        fill_value=-float("inf"),
-        dtype=torch.float32,
-        device=Q.device,
-    )
-
-    stride_q_s, stride_q_h, stride_q_d = Q.stride()
-    stride_kv_s, stride_kv_d = KV.stride()
-    stride_w_s, stride_w_h = weights.stride()
-    stride_logits_s, stride_logits_k = logits.stride()
-
-    # BLOCK_Q=16: Processes 16 queries at once. Reduces memory loads by 16x.
-    # BLOCK_KV=64: Keeps LDS usage safe (~32KB total).
-    BLOCK_Q = 16
-    BLOCK_KV = 64
-
-    # Grid is now smaller because we handle BLOCK_Q items per program
-    grid = (triton.cdiv(seq_len, BLOCK_Q),)
-
-    _fp16_mqa_logits_kernel[grid](
-        Q_ptr=Q,
-        KV_ptr=KV,
-        weights_ptr=weights,
-        cu_start_ptr=cu_starts,
-        cu_end_ptr=cu_ends,
-        logits_ptr=logits,
-        seq_len=seq_len,
-        seq_len_kv=seq_len_kv,
-        NUM_HEADS=num_heads,
-        HEAD_SIZE=head_size,
-        stride_q_s=stride_q_s,
-        stride_q_h=stride_q_h,
-        stride_q_d=stride_q_d,
-        stride_kv_s=stride_kv_s,
-        stride_kv_d=stride_kv_d,
-        stride_w_s=stride_w_s,
-        stride_w_h=stride_w_h,
-        stride_logits_s=stride_logits_s,
-        stride_logits_k=stride_logits_k,
-        BLOCK_Q=BLOCK_Q,
-        BLOCK_KV=BLOCK_KV,
-        num_warps=4,
-        num_stages=1,     # Must be 1. Inner loop handles logic.
-        waves_per_eu=1,   # Conservative for safety on MI50 and best value possible for perf
-    )
-
-    return logits
 
 # Take from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py#L84
 def fp8_mqa_logits_torch(
@@ -250,7 +68,7 @@ def fp16_mqa_logits_torch(
     """Compute MQA logits for a single sequence without KV paging.
 
     Args:
-        q: Query tensor of shape [M, H, D]. fp16
+        q: Query tensor of shape [M, H, D]. --dtype
         kv: `kv` has shape [N, D] with dtype `torch.float16` 
         weights: weights of shape [M, H], dtype `torch.float32`.
         cu_seqlen_ks: Start indices (inclusive) for valid K per query position,
@@ -262,16 +80,12 @@ def fp16_mqa_logits_torch(
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
     k = kv.float()
-    q = q.float()
+    if q.dtype != torch.float32:
+        q = q.float()
     
     seq_len_kv = kv.shape[0]
     num_q, num_heads, _ = q.shape
 
-    # TODO: Make HEAD_CHUNK_SIZE as env variable if this non optimized vibe coded pytorch ops is still used in future build
-    # Because HEAD_CHUNK_SIZE is also used in vllm/model_executor/models/deepseek_v2.py - sparse_attn_indexer_fake for the profile run to get correct memory usage
-    # TUNE HEAD_CHUNK_SIZE according to AVAILABLE GPU VRAM 
-    # 4 heads * 512 tokens * 2 (peak factor) * 32k context * 4 bytes ~= 0.5 GB memory peak / GPU.
-    HEAD_CHUNK_SIZE = 4 
 
     # 1. Pre-allocate output
     final_logits = torch.full(
@@ -282,12 +96,8 @@ def fp16_mqa_logits_torch(
     )
 
     # 2. Prepare Mask (Broadcasting later)
-    mask_lo = (
-        torch.arange(0, seq_len_kv, device="cuda")[None, :] >= cu_seqlen_ks[:, None]
-    )
-    mask_hi = (
-        torch.arange(0, seq_len_kv, device="cuda")[None, :] < cu_seqlen_ke[:, None]
-    )
+    mask_lo = (torch.arange(0, seq_len_kv, device="cuda")[None, :] >= cu_seqlen_ks[:, None])
+    mask_hi = (torch.arange(0, seq_len_kv, device="cuda")[None, :] < cu_seqlen_ke[:, None])
     mask = mask_lo & mask_hi
 
     # Accumulator
@@ -299,8 +109,10 @@ def fp16_mqa_logits_torch(
     k_t = k.t() # [D, N]
 
     # 3. Chunked Loop
-    for i in range(0, num_heads, HEAD_CHUNK_SIZE):
-        end = min(i + HEAD_CHUNK_SIZE, num_heads)
+    # 4 VLLM_FP16_MQA_TORCH_HEAD_CHUNK_SIZE * 512 tokens * 2 (peak factor) * 32k context * 4 bytes ~= 0.5 GB memory peak / GPU.
+
+    for i in range(0, num_heads, envs.VLLM_FP16_MQA_TORCH_HEAD_CHUNK_SIZE):
+        end = min(i + envs.VLLM_FP16_MQA_TORCH_HEAD_CHUNK_SIZE, num_heads)
         
         # Slice the chunk: Shape [Chunk_Size, M, D]
         q_chunk = q_per_head[i:end] 
@@ -309,16 +121,14 @@ def fp16_mqa_logits_torch(
         # Matmul: [Chunk, M, D] @ [D, N] -> [Chunk, M, N]
         # This is the heavy lifting.
         score_chunk = torch.matmul(q_chunk, k_t)
-        
         score_chunk = torch.relu(score_chunk)
         
         # Weighted sum: Sum over the chunk dimension (dim 0)
         # [Chunk, M, N] * [Chunk, M, 1] -> [Chunk, M, N] -> Sum -> [M, N]
         chunk_sum = (score_chunk * w_chunk).sum(dim=0)
-        
         weighted_sum.add_(chunk_sum)
         
-        # Explicit delete to encourage memory freeing before next chunk
+        # Free tensor immediately to reduce memory pressure before next chunk
         del score_chunk
         del chunk_sum
 
@@ -365,10 +175,9 @@ def rocm_mqa_logits(
         return fp8_mqa_logits(q, kv, scale, weights, cu_seqlen_ks, cu_seqlen_ke)
     elif not envs.VLLM_ROCM_USE_AITER and not envs.VLLM_ROCM_USE_AITER_MLA_SPARSE_FP16:
         return fp8_mqa_logits_torch(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
-    elif not envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_MLA_SPARSE_FP16:
+    elif envs.VLLM_ROCM_USE_AITER_MLA_SPARSE_FP16:
         return fp16_mqa_logits_torch(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
-    elif envs.VLLM_ROCM_USE_AITER and envs.VLLM_ROCM_USE_AITER_MLA_SPARSE_FP16:
-        return fp16_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
+    # only torch kernel available here for q_fp16 or q_fp32 as it is much faster than triton equivalent for gfx906
 
 # Taken from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py#L156
 def fp8_paged_mqa_logits_torch(
@@ -427,11 +236,11 @@ def fp8_paged_mqa_logits_torch(
 
 # Taken from https://github.com/deepseek-ai/DeepGEMM/blob/main/tests/test_attention.py#L156
 def fp16_paged_mqa_logits_torch(
-    q: torch.Tensor,
-    kv_cache: torch.Tensor,
-    weights: torch.Tensor,
-    context_lens: torch.Tensor,
-    block_tables: torch.Tensor,
+    q: torch.Tensor, # --dtype
+    kv_cache: torch.Tensor, # fp16
+    weights: torch.Tensor, # fp32
+    context_lens: torch.Tensor, # int32
+    block_tables: torch.Tensor, # int32
     max_model_len: int,
 ):
 
@@ -456,7 +265,7 @@ def fp16_paged_mqa_logits_torch(
         kv_slice = kv_cache[block_idxs]                 # [num_blocks, block_size, kv_heads, dim]
         kx = kv_slice.permute(2, 3, 0, 1).reshape(kv_slice.size(2), dim, -1)    # [kv_heads, dim, total_tokens]
         qx = q[i].transpose(0, 1)                       # q[i]: [next_n, heads, dim] -> [heads, next_n, dim]
-        s = torch.matmul(qx.float(), kx.float())       # [heads, next_n, dim] @ [1, dim, total_tokens] -> [heads, next_n, total_tokens] in fp32 here
+        s = torch.matmul(qx.to(torch.float16) if qx.dtype == torch.float32 else qx, kx).float()       # [heads, next_n, dim] @ [1, dim, total_tokens] -> [heads, next_n, total_tokens] in fp32 here
 
         total_len = num_blocks * block_size
         k_offsets = torch.arange(0, total_len, device=q.device)
@@ -587,7 +396,7 @@ def _deepgemm_fp16_paged_mqa_logits_stage1(
         context_length - split_context_start, split_context_chunk_num * ChunkK
     )
 
-    # 1. Load Q (FP16)
+    # 1. Load Q (dtype)
     q = tl.load(
         Q_buffer
         + pid_batch * stride_q_batch
@@ -637,7 +446,7 @@ def _deepgemm_fp16_paged_mqa_logits_stage1(
         )
 
         # 5. Dot Product (FORCE FP32 ACCUMULATION)
-        o = tl.dot(q.to(tl.float32), k.T.to(tl.float32), out_dtype=tl.float32)
+        o = tl.dot(q.to(tl.float16) if q.dtype == tl.float32 else q, k.T, out_dtype=tl.float32)
         
         # 6. Activation (ReLU)
         # Matches reference: s = torch.relu(s)
@@ -668,7 +477,7 @@ def _deepgemm_fp16_paged_mqa_logits_stage1(
 
 # First implementation attempt, not optimized, currently less stable (at 18k+ tokens context) but faster than torch reference
 def deepgemm_fp16_paged_mqa_logits_stage1(
-    q: torch.Tensor,           # [Batch, NextN, Heads, Dim] (FP16)
+    q: torch.Tensor,           # [Batch, NextN, Heads, Dim] (--dtype)
     kv_cache: torch.Tensor,    # [NumBlocks, BlockSize, 1, Dim] (FP16)
     weights: torch.Tensor,     # [Batch * NextN, Heads] (FP32)
     out_qk: torch.Tensor,      # Output Logits (FP32)
@@ -683,9 +492,6 @@ def deepgemm_fp16_paged_mqa_logits_stage1(
     num_warps: int = 4,   # Sweet spot for register usage on gfx906.
     num_stages: int = 1,  # Essential for stability (avoids LDS crashes)
 ):
-    # Validation
-    assert q.dtype == torch.float16
-    assert kv_cache.dtype == torch.float16
     
     # Check Block Size matches ChunkK
     block_size = kv_cache.size(1) 

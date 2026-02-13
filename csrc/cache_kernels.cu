@@ -217,7 +217,13 @@ struct CopyWithScaleOp {
 
   __device__ __forceinline__ void operator()(OutT& dst, const InT src) const {
     if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
-      dst = static_cast<OutT>(src);
+      if constexpr (std::is_same<OutT, InT>::value) {
+        dst = static_cast<OutT>(src);
+      } else {
+        // Cross-type conversion (e.g., float -> half, bf16 -> half)
+        __half h = __float2half(static_cast<float>(src));
+        dst = *reinterpret_cast<OutT*>(&h);
+      }
     } else {
       dst = fp8::scaled_convert<OutT, InT, kv_dt>(src, scale);
     }
@@ -391,7 +397,13 @@ __global__ void concat_and_cache_mla_kernel(
       const int64_t dst_idx =
           block_idx * block_stride + block_offset * entry_stride + i + offset;
       if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
-        dst[dst_idx] = src[src_idx];
+        if constexpr (std::is_same<scalar_t, cache_t>::value) {
+          dst[dst_idx] = src[src_idx];
+        } else {
+          // Cross-type conversion (e.g., float -> half, bf16 -> half)
+          __half h = __float2half(static_cast<float>(src[src_idx]));
+          dst[dst_idx] = *reinterpret_cast<cache_t*>(&h);
+        }
       } else {
         dst[dst_idx] =
             fp8::scaled_convert<cache_t, scalar_t, kv_dt>(src[src_idx], *scale);
@@ -1103,8 +1115,20 @@ __global__ void gather_and_maybe_dequant_cache(
 #pragma unroll
     for (int idx = threadIdx.x; idx < vec_iter_cnt; idx += CTA_SIZE) {
       if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
-        reinterpret_cast<stype*>(dst_)[idx] =
-            static_cast<stype>(reinterpret_cast<ltype*>(src_)[idx]);
+        if constexpr (std::is_same<scalar_t, cache_t>::value) {
+          reinterpret_cast<stype*>(dst_)[idx] =
+              static_cast<stype>(reinterpret_cast<ltype*>(src_)[idx]);
+        } else {
+          // Cross-type dequant (e.g., half cache -> float/bf16 dst)
+          ltype loaded_val = reinterpret_cast<ltype*>(src_)[idx];
+          stype store_val;
+#pragma unroll
+          for (int j = 0; j < vec_size; ++j) {
+            __half h = *reinterpret_cast<const __half*>(&loaded_val.val[j]);
+            store_val.val[j] = static_cast<scalar_t>(__half2float(h));
+          }
+          reinterpret_cast<stype*>(dst_)[idx] = store_val;
+        }
       } else {
         ltype loaded_val = reinterpret_cast<ltype*>(src_)[idx];
         stype store_val;
@@ -1123,7 +1147,12 @@ __global__ void gather_and_maybe_dequant_cache(
 #pragma unroll
     for (int idx = threadIdx.x; idx < tail_cnt; idx += CTA_SIZE) {
       if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
-        dst_[idx] = static_cast<scalar_t>(src_[idx]);
+        if constexpr (std::is_same<scalar_t, cache_t>::value) {
+          dst_[idx] = static_cast<scalar_t>(src_[idx]);
+        } else {
+          __half h = *reinterpret_cast<const __half*>(&src_[idx]);
+          dst_[idx] = static_cast<scalar_t>(__half2float(h));
+        }
       } else {
         dst_[idx] =
             fp8::scaled_convert<scalar_t, cache_t, kv_dt>(src_[idx], *scale);

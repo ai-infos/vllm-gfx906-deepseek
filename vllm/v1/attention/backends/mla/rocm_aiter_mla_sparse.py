@@ -67,7 +67,7 @@ class ROCMAiterMLASparseBackend(AttentionBackend):
     @classmethod
     def get_supported_dtypes(cls) -> list[torch.dtype]:
         # --- float16 added for gfx906 support ---
-        return [torch.float16, torch.bfloat16]
+        return [torch.float16, torch.bfloat16, torch.float32]
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -183,9 +183,13 @@ def reference_mla_sparse_prefill(
     invalid_mask = (indices < 0) | (indices >= s_kv)    # [s_q, topk]
     indices[invalid_mask] = 0
 
-    q = q.float()
-    gathered_kv = kv.index_select(dim=0, index=indices.flatten()).reshape(s_q, topk, d_qk).float()   # [s_q, topk, d_qk]
-    P = (q @ gathered_kv.transpose(1, 2))   # [s_q, h_q, topk]
+    gathered_kv = kv.index_select(dim=0, index=indices.flatten()).reshape(s_q, topk, d_qk)   # [s_q, topk, d_qk]
+    if q.dtype == torch.float32 and kv.dtype == torch.float32:
+        P = q @ gathered_kv.transpose(1, 2)  # [s_q, h_q, topk]
+    elif q.dtype == torch.float32 and kv.dtype in [torch.bfloat16, torch.float16]: 
+        P = q @ gathered_kv.transpose(1, 2).float()   # [s_q, h_q, topk]
+    else: # q and kv are both assumed fp16 or bf16 (otherwise it will throw an error)
+        P = (q @ gathered_kv.transpose(1, 2)).float()
     P *= sm_scale
     P[invalid_mask.unsqueeze(1).broadcast_to(P.shape)] = float("-inf")
 
@@ -196,11 +200,14 @@ def reference_mla_sparse_prefill(
         orig_lse = orig_lse.clone()
     orig_lse[orig_lse == float("-inf")] = float("+inf")   # So that corresponding O will be 0
     s_for_o = torch.exp(P - orig_lse.unsqueeze(-1))
-    out = s_for_o @ gathered_kv[..., :d_v]   # [s_q, h_q, dv]
+    if kv.dtype == torch.float32:
+        out = s_for_o @ gathered_kv[..., :d_v]   # [s_q, h_q, dv]
+    else:
+        out = s_for_o @ gathered_kv[..., :d_v].float()   # [s_q, h_q, dv]
 
     #lonely_q_mask = orig_lse == float("-inf")   # [s_q, h_q]
     #orig_lse[lonely_q_mask] = float("+inf")
-    return (out.to(kv.dtype), None)
+    return (out if q.dtype == torch.float32 else out.to(q.dtype), None)
 
 
 class ROCMAiterMLASparseImpl(MLACommonBaseImpl[ROCMAiterMLASparseMetadata]):

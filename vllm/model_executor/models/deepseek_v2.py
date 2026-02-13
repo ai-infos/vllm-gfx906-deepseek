@@ -821,27 +821,6 @@ def sparse_attn_indexer_fake(
             [total_seq_lens, head_dim], device=k.device, dtype=torch.float16
         )
 
-    if envs.VLLM_ATTENTION_BACKEND=="ROCM_AITER_MLA_SPARSE" and not envs.VLLM_ROCM_USE_AITER: 
-        # In the profile run, q.shape[0] is typically max_num_batched_tokens (2048)
-        batch_size = q.shape[0]
-        
-        # We simulate the worst-case logits allocation.
-        # Even though Triton uses 1 tensor, we allocate 2x to create a safety buffer 
-        # against fragmentation and overhead from the Gather ops.
-        
-        # Buffer 1: The theoretical logits
-        _mimic_logits_1 = torch.empty(
-            (batch_size, max_model_len),
-            device=q.device, 
-            dtype=torch.float32 
-        )
-        
-        # Buffer 2: The safety padding (forces vLLM to reserve extra free VRAM)
-        _mimic_logits_2 = torch.empty(
-            (batch_size, max_model_len),
-            device=q.device, 
-            dtype=torch.float32 
-        )
 
     return topk_indices_buffer
 
@@ -1658,8 +1637,8 @@ class DeepseekV2ForCausalLM(
                 if is_fusion_moe_shared_experts_layer:
                     num_chunks = getattr(self.config, "n_shared_experts", 1) or 1
                     # Determine split axis based on op type
-                    # gate/up: ColumnParallel → split along dim 0
-                    # down: RowParallel → split along dim 1
+                    # gate/up: ColumnParallel -> split along dim 0
+                    # down: RowParallel -> split along dim 1
                     split_dim = (
                         1
                         if ("down_proj.weight" in name and loaded_weight.ndim > 1)

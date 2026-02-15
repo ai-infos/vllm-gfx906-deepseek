@@ -1141,6 +1141,9 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
         self.indexer = indexer
         self.q_pad_num_heads = q_pad_num_heads
         self.is_aiter_triton_fp8_bmm_enabled = rocm_aiter_ops.is_fp8bmm_enabled()
+        _KV_DTYPE_MAP = {"half": torch.float16, "bfloat16": torch.bfloat16}
+        self.kv_16bits_dtype = _KV_DTYPE_MAP.get(self.kv_cache_dtype)
+        self.is_16bits_casting_enabled = False
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         def get_layer_weight(layer):
@@ -1237,6 +1240,28 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             # Convert from (L, N, P) to (N, P, L)
             self.W_UK_T = W_UK.permute(1, 2, 0)
 
+            # Pre-cache 16-bit copies of weight matrices if --dtype is fp32
+            # to avoid per-call .to() GPU allocations during inference
+            if self.W_UK_T.dtype == torch.float32 and self.kv_16bits_dtype is not None:
+                self.is_16bits_casting_enabled = True
+                # Cast to 16 bits kv cache dtype (fp16/bf16) if --dtype is fp32 for perf
+                self.W_UV = self.W_UV.to(self.kv_16bits_dtype)
+                self.W_UK_T = self.W_UK_T.to(self.kv_16bits_dtype)
+                self._v_proj_buf: torch.Tensor | None = None
+    
+    def _get_v_proj_buffer(
+        self, N: int, B: int, V: int,
+        dtype: torch.dtype, device: torch.device,
+    ) -> torch.Tensor:
+        """Return a (N, B, V) fp16 buffer, reusing previous allocation
+        when possible. Only reallocates if batch size grew."""
+        buf = self._v_proj_buf
+        if buf is None or buf.shape[1] < B:
+            # Allocate (or grow) the buffer
+            buf = torch.empty(N, B, V, dtype=dtype, device=device)
+            self._v_proj_buf = buf
+        return buf[:N, :B, :V]
+
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
         # Convert from (B, N, L) to (N, B, L)
         x = x.view(-1, self.num_heads, self.kv_lora_rank).transpose(0, 1)
@@ -1251,8 +1276,19 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             # Convert from (B, N * V) to (N, B, V)
             out = out.view(-1, self.num_heads, self.v_head_dim).transpose(0, 1)
 
-            # Multiply (N, B, L) x (N, L, V) -> (N, B, V)
-            torch.bmm(x, self.W_UV, out=out)  # Reuse "out" to make it "hot"
+            if self.is_16bits_casting_enabled:
+                # bmm in fp16 for perf on gfx906
+                # Use persistent buffer to avoid per-call GPU allocations
+                N, B, L = x.shape
+                V = self.v_head_dim
+                buf = self._get_v_proj_buffer(N, B, V, x.dtype, x.device)
+                # Multiply (N, B, L) x (N, L, V) -> (N, B, V) into buffer
+                torch.bmm(x, self.W_UV, out=buf)
+                # copy_ auto-casts fp16 -> fp32, no intermediate needed
+                out.copy_(buf)
+            else:
+                # Multiply (N, B, L) x (N, L, V) -> (N, B, V)
+                torch.bmm(x, self.W_UV, out=out)  # Reuse "out" to make it "hot"
 
             # Convert from (N, B, V) to (B, N * V)
             out_new = out.transpose(0, 1).reshape(-1, self.num_heads * self.v_head_dim)

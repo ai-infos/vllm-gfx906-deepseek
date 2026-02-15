@@ -11,6 +11,8 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
+    VLLM_ROCM_MLA_SPARSE_CHUNK_THRESHOLD: int = 2
+    VLLM_ROCM_MLA_SPARSE_CHUNK_SIZE: int = 512
     VLLM_FP16_MQA_TORCH_HEAD_CHUNK_SIZE: int = 4
     VLLM_MLA_SPARSE_DISABLE_EXPERIMENTAL: bool = False
     VLLM_ROCM_USE_LEGACY_TRITON_FA: bool = False
@@ -586,6 +588,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "LOCAL_RANK": lambda: int(os.environ.get("LOCAL_RANK", "0")),
     "VLLM_FP16_MQA_TORCH_HEAD_CHUNK_SIZE": lambda: int(
         os.environ.get("VLLM_FP16_MQA_TORCH_HEAD_CHUNK_SIZE", "4")
+    ),
+    "VLLM_ROCM_MLA_SPARSE_CHUNK_SIZE": lambda: int(
+        os.environ.get("VLLM_ROCM_MLA_SPARSE_CHUNK_SIZE", "512")
+    ),
+    "VLLM_ROCM_MLA_SPARSE_CHUNK_THRESHOLD": lambda: int(
+        os.environ.get("VLLM_ROCM_MLA_SPARSE_CHUNK_THRESHOLD", "2")
     ),
     # used to control the visible devices in the distributed setting
     "CUDA_VISIBLE_DEVICES": lambda: os.environ.get("CUDA_VISIBLE_DEVICES", None),

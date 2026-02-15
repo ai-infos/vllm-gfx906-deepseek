@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, ClassVar, Optional
 
 import numpy as np
 import torch
+import vllm.envs as envs
 
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
@@ -161,20 +162,76 @@ class ROCMAiterMLASparseMetadataBuilder(
         )
         return metadata
 
+# GPU-chunked reference implementation for sparse MLA prefill.
+# Chunks over QUERY tokens to keep peak VRAM usage bounded.
+def reference_mla_sparse_prefill_chunked(
+    q: torch.Tensor,       # [s_q, h_q, d_qk] # in kv dtype
+    kv: torch.Tensor,      # [total_kv, 1, d_qk]
+    indices: torch.Tensor, # [s_q, 1, topk]
+    sm_scale: float,
+    d_v: int,
+) -> torch.Tensor:
+    """
+    GPU reference that chunks over QUERY tokens to avoid OOM.
+    Memory per chunk: envs.VLLM_ROCM_MLA_SPARSE_CHUNK_SIZE * topk * d_qk * 4 bytes (FP32)
+    With envs.VLLM_ROCM_MLA_SPARSE_CHUNK_SIZE=512, topk=2048, d_qk=576:
+      512 * 2048 * 576 * 4 = 2416 MB (safe on 32GB GPU)
+    """
+    indices = indices.clone().squeeze(1)  # [s_q, topk]
+    topk = indices.shape[-1]
+    skv = kv.shape[0]
+    s_q, h_q, d_qk = q.shape  # [s_q, h_q, d_qk]
+
+    out = torch.empty(s_q, h_q, d_v, device=q.device, dtype=kv.dtype)
+
+    for start in range(0, s_q, envs.VLLM_ROCM_MLA_SPARSE_CHUNK_SIZE):
+        end = min(start + envs.VLLM_ROCM_MLA_SPARSE_CHUNK_SIZE, s_q)
+
+        q_chunk = q[start:end]          # [cs, h_q, d_qk]
+        idx_chunk = indices[start:end]  # [cs, topk]
+
+        # Mark invalid indices (-1 or out-of-bounds)
+        invalid = (idx_chunk < 0) | (idx_chunk >= skv)
+        idx_chunk[invalid] = 0
+
+        # Gather: [cs, topk, d_qk] this is the memory-critical step
+        kvs = kv.index_select(dim=0, index=idx_chunk.flatten()).reshape(end-start, topk, d_qk)   # [cs, topk, d_qk]
+
+        # Scores: q_chunk @ kvs^T -> [cs, h_q, topk]
+        if kv.dtype == torch.float32:
+            scores = q_chunk @ kvs.transpose(1, 2)
+        else: # q and kv are both fp16 or bf16
+            scores = (q_chunk @ kvs.transpose(1, 2)).float() # 16 bits matmul for performanc
+        scores.masked_fill_(invalid.unsqueeze(1), float("-inf"))
+        scores *= sm_scale
+
+        # Softmax via log/exp
+        lse = torch.logsumexp(scores , dim=-1)  # [cs, h_q]
+        attn = torch.exp(scores - lse.unsqueeze(-1))  # [cs, h_q, topk]
+
+        # Weighted sum of values (first d_v dims of KV)
+        if kv.dtype == torch.float32:
+            out[start:end] = attn @ kvs[..., :d_v]   # [cs, h_q, dv]
+        else:
+            out[start:end] = attn.to(kv.dtype) @ kvs[..., :d_v]  # 16 bits matmul for performance
+
+        # Free gather tensor immediately to reduce memory pressure
+        del kvs, scores, attn
+
+    return out # in kv dtype
 
 # Take from
 # https://github.com/deepseek-ai/FlashMLA/blob/082094b793fcc7452977d0a71a00e266a2e3061e/tests/ref.py
 def reference_mla_sparse_prefill(
-    q: torch.Tensor, 
+    q: torch.Tensor, # in kv dtype
     kv: torch.Tensor, 
     indices: torch.Tensor, 
     sm_scale: float, 
     d_v: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """
     Returns:
     - o: [s_q, h_q, dv]
-    - None (lse not returned as not used in the current implementation)
     """
     indices = indices.clone().squeeze(1)
     topk = indices.shape[-1]
@@ -184,31 +241,21 @@ def reference_mla_sparse_prefill(
     indices[invalid_mask] = 0
 
     gathered_kv = kv.index_select(dim=0, index=indices.flatten()).reshape(s_q, topk, d_qk)   # [s_q, topk, d_qk]
-    if q.dtype == torch.float32 and kv.dtype == torch.float32:
-        P = q @ gathered_kv.transpose(1, 2)  # [s_q, h_q, topk]
-    elif q.dtype == torch.float32 and kv.dtype in [torch.bfloat16, torch.float16]: 
-        P = q @ gathered_kv.transpose(1, 2).float()   # [s_q, h_q, topk]
-    else: # q and kv are both assumed fp16 or bf16 (otherwise it will throw an error)
-        P = (q @ gathered_kv.transpose(1, 2)).float()
+    if kv.dtype == torch.float32:
+        P = q @ gathered_kv.transpose(1, 2) # [s_q, h_q, topk]
+    else: # q and kv are both fp16 or bf16
+        P = (q @ gathered_kv.transpose(1, 2)).float() # 16 bits matmul for performance
+    P.masked_fill_(invalid_mask.unsqueeze(1), float("-inf"))
     P *= sm_scale
-    P[invalid_mask.unsqueeze(1).broadcast_to(P.shape)] = float("-inf")
 
     orig_lse = torch.logsumexp(P, dim=-1)   # [s_q, h_q]
-    #max_logits = P.max(dim=-1).values   # [s_q, h_q]
-
-    if not torch.is_inference_mode_enabled():
-        orig_lse = orig_lse.clone()
-    orig_lse[orig_lse == float("-inf")] = float("+inf")   # So that corresponding O will be 0
     s_for_o = torch.exp(P - orig_lse.unsqueeze(-1))
     if kv.dtype == torch.float32:
         out = s_for_o @ gathered_kv[..., :d_v]   # [s_q, h_q, dv]
     else:
-        out = s_for_o @ gathered_kv[..., :d_v].float()   # [s_q, h_q, dv]
+        out = s_for_o.to(kv.dtype) @ gathered_kv[..., :d_v] # [s_q, h_q, dv] 16 bits matmul for performance
 
-    #lonely_q_mask = orig_lse == float("-inf")   # [s_q, h_q]
-    #orig_lse[lonely_q_mask] = float("+inf")
-    return (out if q.dtype == torch.float32 else out.to(q.dtype), None)
-
+    return out # in kv dtype
 
 class ROCMAiterMLASparseImpl(MLACommonBaseImpl[ROCMAiterMLASparseMetadata]):
     def __init__(
@@ -259,9 +306,19 @@ class ROCMAiterMLASparseImpl(MLACommonBaseImpl[ROCMAiterMLASparseMetadata]):
         )
 
         topk_indices = topk_indices.view(num_tokens, 1, -1)
-        output = reference_mla_sparse_prefill(
-            q, kv_c_and_k_pe_cache, topk_indices, self.softmax_scale, 512
-        )[0]
+
+        use_chunked = attn_metadata.max_query_len > envs.VLLM_ROCM_MLA_SPARSE_CHUNK_THRESHOLD # e.g. if threshold is 2, it assumes chunked used only in prefill step with MTP enabled ("num_speculative_tokens": 1)
+
+        if use_chunked:
+            output = reference_mla_sparse_prefill_chunked(
+                q, kv_c_and_k_pe_cache, topk_indices,
+                self.softmax_scale, 512,
+            )
+        else:
+            output = reference_mla_sparse_prefill(
+                q, kv_c_and_k_pe_cache, topk_indices,
+                self.softmax_scale, 512,
+            )
         return output[:, : self.num_heads, :]
 
     def forward(
@@ -296,7 +353,8 @@ class ROCMAiterMLASparseImpl(MLACommonBaseImpl[ROCMAiterMLASparseMetadata]):
 
         # Inputs and outputs may be padded for CUDA graphs
 
-        q = q[:num_actual_toks, ...]
+        # Cast to 16 bits kv cache dtype (fp16/bf16) if --dtype is fp32 for perf
+        q = q[:num_actual_toks, ...].to(kv_cache.dtype) if self.is_16bits_casting_enabled else q[:num_actual_toks, ...]
         k_c_normed = k_c_normed[:num_actual_toks, ...]
         k_pe = k_pe[:num_actual_toks, ...]
 
